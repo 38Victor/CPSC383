@@ -24,6 +24,7 @@ from aegis import (
 from agent import BaseAgent, Brain, LogLevels
 from aegis.common.world.cell import Cell
 from aegis.common import Location
+from aegis.common import AgentID
 import heapq
 
 
@@ -31,6 +32,8 @@ class ExampleAgent(Brain):
     def __init__(self) -> None:
         super().__init__()
         self._agent: BaseAgent = BaseAgent.get_base_agent()
+        self.sent_initial_message = False  # Track if "initial" message has been sent
+
 
     @override
     def handle_connect_ok(self, connect_ok: CONNECT_OK) -> None:
@@ -46,9 +49,15 @@ class ExampleAgent(Brain):
 
     @override
     def handle_send_message_result(self, smr: SEND_MESSAGE_RESULT) -> None:
-        BaseAgent.log(LogLevels.Always, f"SEND_MESSAGE_RESULT: {smr}")
-        BaseAgent.log(LogLevels.Test, f"{smr}")
-        print("#--- You need to implement handle_send_message_result function! ---#")
+        BaseAgent.log(LogLevels.Always, f"Received message: {smr.message}")
+
+        if smr.message == "helpDig":
+            # Respond to helpDig with helpDidComing
+            self._agent.send(
+                SEND_MESSAGE(
+                    AgentIDList(), "helpDidComing"
+                )
+            )
 
     @override
     def handle_move_result(self, mr: MOVE_RESULT) -> None:
@@ -85,6 +94,22 @@ class ExampleAgent(Brain):
         BaseAgent.log(LogLevels.Test, f"{tdr}")
         print("#--- You need to implement handle_team_dig_result function! ---#")
 
+    @override
+    def handle_send_message_result(self, smr: SEND_MESSAGE_RESULT) -> None:
+        BaseAgent.log(LogLevels.Always, f"Message received: {smr.msg}")
+
+        if smr.msg.startswith("LOC_UPDATE:"):
+            # Parse the location update message
+            try:
+                _, content = smr.msg.split(":")
+                sender_id, location = content.split("@")
+                BaseAgent.log(LogLevels.Always, f"Agent {sender_id} is at {location}")
+                
+                # Process the location (e.g., assign tasks, update internal state)
+                self.assign_task_to_agent(sender_id, location)
+            except ValueError:
+                BaseAgent.log(LogLevels.Error, "Malformed LOC_UPDATE message received!")
+
     #This heuristic method below is from under the "Heuristic search" section:
     #https://www.redblobgames.com/pathfinding/a-star/introduction.html
     @classmethod
@@ -97,124 +122,111 @@ class ExampleAgent(Brain):
     def think(self) -> None:
         BaseAgent.log(LogLevels.Always, "Thinking")
 
-
-        # Send a message to other agents in my group.
-        # Empty AgentIDList will send to group members.
-        self._agent.send(
-            SEND_MESSAGE(
-                AgentIDList(), f"Hello from agent {self._agent.get_agent_id().id}"
-            )
-        )
-
-        # Retrieve the current state of the world.
+        # Retrieve the current state of the world
         world = self.get_world()
         if world is None:
             self.send_and_end_turn(MOVE(Direction.CENTER))
             return
 
-        # Fetch the cell at the agent’s current location. If the location is outside the world’s bounds,
-        # return a default move action and end the turn.
-        cell = world.get_cell_at(self._agent.get_location())
+        # Step 1: Send location update to the team leader (Agent ID 1)
+        team_leader_id = 1  # Assuming Agent ID 1 is the leader
+        current_location = self._agent.get_location()
+        location_update_message = f"LOC_UPDATE:{self._agent.get_agent_id().id}@{current_location}"
+
+        # Send the location update message
+        self._agent.send(
+            SEND_MESSAGE(
+                AgentIDList([AgentID(team_leader_id, self._agent.get_agent_id().gid)]),
+                location_update_message
+            )
+        )
+        BaseAgent.log(LogLevels.Always, f"Sent location update to Agent {team_leader_id}: {location_update_message}")
+
+        # Step 2: Fetch the current cell
+        cell = world.get_cell_at(current_location)
         if cell is None:
             self.send_and_end_turn(MOVE(Direction.CENTER))
             return
-    
 
-        # Get the top layer at the agent’s current location.
-        # If a survivor is present, save it and end the turn.
+        # Step 3: Check for survivors or rubble and take action
         top_layer = cell.get_top_layer()
         if top_layer:
-            self.send_and_end_turn(SAVE_SURV())
+            if isinstance(top_layer, Survivor):
+                self.send_and_end_turn(SAVE_SURV())
+                return
+            elif isinstance(top_layer, Rubble):
+                self.send_and_end_turn(TEAM_DIG())
+                return
+
+        # Step 4: Pathfinding logic to locate the goal
+        goal = None
+        for h in range(world.height):
+            for w in range(world.width):
+                locationS = Location(w, h)
+                survCell = world.get_cell_at(locationS)
+                if survCell and survCell.survivor_chance != 0:
+                    goal = survCell
+                    break
+            if goal:
+                break
+
+        if not goal:
+            # No goal found; take a default action
+            self.send_and_end_turn(MOVE(Direction.CENTER))
             return
 
-        # Initialize the goal cell to be used later
-        goal = Cell ()
-        for h in range(world.height):   # We iterate through two loops through the world size
-            for w in range(world.width):
-                locationS = Location (w, h) 
-                survCell = world.get_cell_at(locationS) # Initialize a location
-                if survCell.survivor_chance != 0:    # If this is the survivor cell (percent_chance is not 0,
-                    goal = survCell                 # then make the goal equal to this cell)
-
-
-        # The A* algorithm below is based from the pseudocode under "The A* algorithm" section: 
-        # https://www.redblobgames.com/pathfinding/a-star/introduction.html
+        # Step 5: A* Pathfinding to the goal
         frontier = []
-        start = self._agent.get_location()      # Initialize the start location
-        heapq.heappush(frontier, (0, start))    # Heap push in the frontier list and (priority, location)
-        came_from = dict()
-        cost_so_far = dict()
-        came_from[start] = None                 # initial values into came_from and cost_so_far 
+        start = current_location
+        heapq.heappush(frontier, (0, start))
+        came_from = {}
+        cost_so_far = {}
+        came_from[start] = None
         cost_so_far[start] = 0
 
-        # While the frontier has something in it
         while frontier:
-            prior, current = heapq.heappop(frontier)  # Put the higher priority in our frontier to current
+            _, current = heapq.heappop(frontier)
 
             if current == goal.location:
-                # Reconstruct the path
+                # Reconstruct the path to the goal
                 path = []
                 while current != start:
                     path.append(current)
-                    current = came_from.get(current)  # Use .get() to avoid KeyError
-                    if current is None:  # Handle broken paths
+                    current = came_from.get(current)
+                    if current is None:
                         BaseAgent.log(LogLevels.Error, "Path reconstruction failed. No valid path to goal.")
-                        self.send_and_end_turn(MOVE(Direction.CENTER))  # Default fallback action
+                        self.send_and_end_turn(MOVE(Direction.CENTER))
                         return
-                path.append(start)
                 path.reverse()
 
-                # Check if path length is sufficient for movement
-                if len(path) < 2:
-                    BaseAgent.log(LogLevels.Warning, "Path too short. Agent likely at the goal.")
-                    self.send_and_end_turn(SAVE_SURV())  # Try saving if at the goal
-                    return
-
-                # Proceed with movement
-                first_location = path[0]
-                second_location = path[1]
-                dx = second_location.x - first_location.x
-                dy = second_location.y - first_location.y
-                mov_dir = Direction(dx, dy)
-                self.send_and_end_turn(MOVE(mov_dir))
+                # Move along the path
+                if len(path) > 1:
+                    dx = path[1].x - path[0].x
+                    dy = path[1].y - path[0].y
+                    self.send_and_end_turn(MOVE(Direction(dx, dy)))
+                else:
+                    self.send_and_end_turn(MOVE(Direction.CENTER))
                 return
-            
-            # Loop through all 9 directions around the current cell
+
+            # Explore neighbors
             for direct in Direction:
-                direct_location = Location(0, 0)             # Initialize the neighbor location 
-                direct_location.x = current.x + direct.dx    # Then find the coordinates for the selected neighbour
-                direct_location.y = current.y + direct.dy
+                neighbor = Location(current.x + direct.dx, current.y + direct.dy)
+                if not world.on_map(neighbor):
+                    continue
 
-                # If the direction location is not outside of bounds, then proceed
-                if ((world.width-1 >=direct_location.x >= 0) and (world.height-1 >=direct_location.y >= 0)):
-                    next_cost = world.get_cell_at(direct_location).move_cost # get the move cost at the neighbouring location
-                    new_cost = cost_so_far[current] + next_cost      # Add the value in cost_so_far with the value of the neighbour location
+                next_cell = world.get_cell_at(neighbor)
+                if not next_cell or not next_cell.is_normal_cell():
+                    continue
 
-                    # Handles if it is out of energy, we continue to the next iteration of the loop
-                    if world.get_cell_at(direct_location).move_cost >= self._agent.get_energy_level():
-                        continue
-                    # Initialize the cell at the neighbour location
-                    next_cell = world.get_cell_at(direct_location)      
-                    # If the neighbour's location has not been accounted for, or the new_cost is less than the cost so far of neighbor
-                    # And the neighboring cell is stable, we can proceed
-                    if (direct_location not in cost_so_far or new_cost < cost_so_far[direct_location]) and next_cell.is_normal_cell():             
-                        cost_so_far[direct_location] = new_cost         # Cost so far in the neighboring location is the new_cost
-                        priority = new_cost + ExampleAgent.heuristic(goal.location, direct_location)    #Calculate priority by adding the new cost with the heuristic
-                        heapq.heappush(frontier, (priority, direct_location))   # Push into the frontier the (priority, neighbour location)
-                        came_from[direct_location] = current        # Came from allows us to know the path of where our agent should end
+                new_cost = cost_so_far[current] + next_cell.move_cost
+                if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
+                    cost_so_far[neighbor] = new_cost
+                    priority = new_cost + ExampleAgent.heuristic(goal.location, neighbor)
+                    heapq.heappush(frontier, (priority, neighbor))
+                    came_from[neighbor] = current
 
-        # If a survivor is present, save it and end the turn.
-        if isinstance(top_layer, Survivor):
-            self.send_and_end_turn(SAVE_SURV())
-            return
-
-        # If rubble is present, clear it and end the turn.
-        if isinstance(top_layer, Rubble):
-            self.send_and_end_turn(TEAM_DIG())
-            return
-
-        # Default action: Move the agent north if no other specific conditions are met.
-        self.send_and_end_turn(MOVE(Direction.NORTH))
+        # Step 6: Default fallback action
+        self.send_and_end_turn(MOVE(Direction.CENTER))
 
     def send_and_end_turn(self, command: AgentCommand):
         """Send a command and end your turn."""
