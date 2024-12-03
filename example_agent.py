@@ -22,6 +22,9 @@ from aegis import (
     Survivor,
 )
 from agent import BaseAgent, Brain, LogLevels
+from aegis.common.world.cell import Cell
+from aegis.common import Location
+import heapq
 
 
 class ExampleAgent(Brain):
@@ -82,9 +85,18 @@ class ExampleAgent(Brain):
         BaseAgent.log(LogLevels.Test, f"{tdr}")
         print("#--- You need to implement handle_team_dig_result function! ---#")
 
+    #This heuristic method below is from under the "Heuristic search" section:
+    #https://www.redblobgames.com/pathfinding/a-star/introduction.html
+    @classmethod
+    def heuristic(cls, a:Location, b:Location):
+        # Manhattan distance
+        result =  abs(a.x - b.x) + abs (a.y - b.y)
+        return result
+
     @override
     def think(self) -> None:
         BaseAgent.log(LogLevels.Always, "Thinking")
+
 
         # Send a message to other agents in my group.
         # Empty AgentIDList will send to group members.
@@ -106,9 +118,90 @@ class ExampleAgent(Brain):
         if cell is None:
             self.send_and_end_turn(MOVE(Direction.CENTER))
             return
+    
 
         # Get the top layer at the agent’s current location.
+        # If a survivor is present, save it and end the turn.
         top_layer = cell.get_top_layer()
+        if top_layer:
+            self.send_and_end_turn(SAVE_SURV())
+            return
+
+        # Initialize the goal cell to be used later
+        goal = Cell ()
+        for h in range(world.height):   # We iterate through two loops through the world size
+            for w in range(world.width):
+                locationS = Location (w, h) 
+                survCell = world.get_cell_at(locationS) # Initialize a location
+                if survCell.survivor_chance != 0:    # If this is the survivor cell (percent_chance is not 0,
+                    goal = survCell                 # then make the goal equal to this cell)
+
+
+        # The A* algorithm below is based from the pseudocode under "The A* algorithm" section: 
+        # https://www.redblobgames.com/pathfinding/a-star/introduction.html
+        frontier = []
+        start = self._agent.get_location()      # Initialize the start location
+        heapq.heappush(frontier, (0, start))    # Heap push in the frontier list and (priority, location)
+        came_from = dict()
+        cost_so_far = dict()
+        came_from[start] = None                 # initial values into came_from and cost_so_far 
+        cost_so_far[start] = 0
+
+        # While the frontier has something in it
+        while frontier:
+            prior, current = heapq.heappop(frontier)  # Put the higher priority in our frontier to current
+
+            if current == goal.location:
+                # Reconstruct the path
+                path = []
+                while current != start:
+                    path.append(current)
+                    current = came_from.get(current)  # Use .get() to avoid KeyError
+                    if current is None:  # Handle broken paths
+                        BaseAgent.log(LogLevels.Error, "Path reconstruction failed. No valid path to goal.")
+                        self.send_and_end_turn(MOVE(Direction.CENTER))  # Default fallback action
+                        return
+                path.append(start)
+                path.reverse()
+
+                # Check if path length is sufficient for movement
+                if len(path) < 2:
+                    BaseAgent.log(LogLevels.Warning, "Path too short. Agent likely at the goal.")
+                    self.send_and_end_turn(SAVE_SURV())  # Try saving if at the goal
+                    return
+
+                # Proceed with movement
+                first_location = path[0]
+                second_location = path[1]
+                dx = second_location.x - first_location.x
+                dy = second_location.y - first_location.y
+                mov_dir = Direction(dx, dy)
+                self.send_and_end_turn(MOVE(mov_dir))
+                return
+            
+            # Loop through all 9 directions around the current cell
+            for direct in Direction:
+                direct_location = Location(0, 0)             # Initialize the neighbor location 
+                direct_location.x = current.x + direct.dx    # Then find the coordinates for the selected neighbour
+                direct_location.y = current.y + direct.dy
+
+                # If the direction location is not outside of bounds, then proceed
+                if ((world.width-1 >=direct_location.x >= 0) and (world.height-1 >=direct_location.y >= 0)):
+                    next_cost = world.get_cell_at(direct_location).move_cost # get the move cost at the neighbouring location
+                    new_cost = cost_so_far[current] + next_cost      # Add the value in cost_so_far with the value of the neighbour location
+
+                    # Handles if it is out of energy, we continue to the next iteration of the loop
+                    if world.get_cell_at(direct_location).move_cost >= self._agent.get_energy_level():
+                        continue
+                    # Initialize the cell at the neighbour location
+                    next_cell = world.get_cell_at(direct_location)      
+                    # If the neighbour's location has not been accounted for, or the new_cost is less than the cost so far of neighbor
+                    # And the neighboring cell is stable, we can proceed
+                    if (direct_location not in cost_so_far or new_cost < cost_so_far[direct_location]) and next_cell.is_normal_cell():             
+                        cost_so_far[direct_location] = new_cost         # Cost so far in the neighboring location is the new_cost
+                        priority = new_cost + ExampleAgent.heuristic(goal.location, direct_location)    #Calculate priority by adding the new cost with the heuristic
+                        heapq.heappush(frontier, (priority, direct_location))   # Push into the frontier the (priority, neighbour location)
+                        came_from[direct_location] = current        # Came from allows us to know the path of where our agent should end
 
         # If a survivor is present, save it and end the turn.
         if isinstance(top_layer, Survivor):
